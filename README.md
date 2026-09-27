@@ -37,6 +37,18 @@ python3 app.py --db ./data.db --port 8306
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
+## 实验室报告与消毒证明
+
+- `lab_report`（consignment，角色`lab`/`admin`）：提交`{"report_id","result","reported_at"}`，`result`为`positive`或`negative`。
+  - 阳性：该批次、下游批次（`parent_id`链）及接触链上所有设施一起停运，停运来源记入各对象的`holds`。
+  - 同一`report_id`的重复报告直接忽略，只保留首次结论。
+  - 阴性：只释放该批次`holds`造成的停运，其他批次造成的停运保持不变；全部来源解除后对象恢复停运前状态。
+  - 持有`holds`的批次除`destroy`外不能执行其他动作，须由阴性报告解除。
+- `disinfect`（consignment，角色`quarantine`/`admin`）：提交`{"certificate_date","covered_facility_ids"}`。
+  - 需存在阳性结论，且证明日期晚于阳性结果日期。
+  - 证明必须覆盖该批次停运的全部设施；缺任一场地则保留停运，错误信息列明缺失场地。
+  - 校验通过后解除这些设施的停运，批次本身的检疫状态不变。
+
 ## 测试
 
 ```bash

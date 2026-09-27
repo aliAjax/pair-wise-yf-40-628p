@@ -43,6 +43,59 @@ def trace_downstream(consignments, start_id):
     return result
 
 
+TERMINAL_STATUSES = ("released", "destroyed")
+HOLD_BYPASS_ACTIONS = ("destroy",)
+LAB_RESULTS = ("positive", "negative")
+
+
+def chain_facilities(facilities, consignment_ids):
+    wanted = set(consignment_ids)
+    return [
+        facility
+        for facility in facilities
+        if wanted.intersection(facility.get("data", {}).get("consignment_ids") or [])
+    ]
+
+
+def _require_date(field, value):
+    try:
+        return _date_ordinal(value)
+    except (TypeError, ValueError):
+        raise ValidationError("invalid date for %s: %s" % (field, value))
+
+
+def validate_lab_report(data):
+    for field in ("report_id", "result", "reported_at"):
+        if data.get(field) in (None, ""):
+            raise ValidationError("missing required field: " + field)
+    if data["result"] not in LAB_RESULTS:
+        raise ValidationError("result must be one of: " + ", ".join(LAB_RESULTS))
+    _require_date("reported_at", data["reported_at"])
+
+
+def validate_disinfection(data, positive_reported_at, required_facility_ids):
+    for field in ("certificate_date", "covered_facility_ids"):
+        if data.get(field) in (None, "", []):
+            raise ValidationError("missing required field: " + field)
+    covered = data.get("covered_facility_ids")
+    if not isinstance(covered, list):
+        raise ValidationError("covered_facility_ids must be a list")
+    if not positive_reported_at:
+        raise ValidationError("no positive lab conclusion on record")
+    certificate_day = _require_date("certificate_date", data["certificate_date"])
+    if certificate_day <= _date_ordinal(positive_reported_at):
+        raise ValidationError(
+            "certificate_date must be later than the positive result date %s"
+            % str(positive_reported_at)[:10]
+        )
+    missing = [item for item in required_facility_ids if item not in set(covered)]
+    if missing:
+        raise ValidationError(
+            "certificate does not cover the full contact chain; missing facilities: "
+            + ", ".join(missing)
+        )
+
+
 CUSTOM_CREATE = {'consignment': _validate_consignment}
 CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
 
@@ -54,7 +107,7 @@ class RuleEngine:
     CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
     ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
     CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), 'lab_report': ('admin', 'lab'), 'disinfect': ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -69,6 +122,12 @@ class RuleEngine:
     def _ensure_role(actor, allowed):
         if "*" not in allowed and actor.role not in allowed:
             raise PermissionDenied("role %s is not allowed here" % actor.role)
+
+    def ensure_action_role(self, actor, action, kind=None):
+        allowed = self.ROLE_ACTIONS.get(
+            (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
+        )
+        self._ensure_role(actor, allowed)
 
     @staticmethod
     def _require(data, fields):
@@ -97,6 +156,12 @@ class RuleEngine:
         if entity["status"] not in allowed_statuses:
             raise InvalidTransition(
                 "cannot %s from status %s" % (action, entity["status"])
+            )
+        holds = (entity.get("data") or {}).get("holds") or []
+        if holds and action not in HOLD_BYPASS_ACTIONS:
+            raise InvalidTransition(
+                "cannot %s while holds are active from: %s"
+                % (action, ", ".join(holds))
             )
         allowed_roles = self.ROLE_ACTIONS.get(
             (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
