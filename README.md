@@ -25,6 +25,23 @@ python3 app.py --db ./data.db --port 8306
 ## 核心对象
 
 - `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- 批次可带 `parent_id` 指向上游批次，构成传播链；场地通过 `consignment_id` 或 `consignment_ids` 关联其接触过的批次。
+
+## 实验室报告与停运规则
+
+批次检验（`inspect`）后由 `lab` 角色提交 `lab_report`，字段为 `report_id`、`result`（`positive`/`negative`）、`result_date`：
+
+- **阳性报告**：批次进入 `lab_positive`，阳性批次、全部下游批次（沿 `parent_id` 递归）以及这些批次接触过的全部场地（含与其他批次共享的场地）一起停运，场地进入 `stopped`。
+- **重复报告**：同一 `report_id` 再次提交只保留首次结论，批次与场地状态、版本均不变，审计中标记 `duplicate`。
+- **阴性报告**：批次进入 `lab_negative`，只移除该批次对各场地造成的停运归因；若场地仍被其他阳性批次停运，则保持 `stopped`，全部归因解除后才恢复到停运前状态。
+
+`quarantine` 角色对 `lab_positive` 批次提交 `disinfect`（字段 `certificate_id`、`certificate_date`、`covered_facilities`）：
+
+- 证书日期必须**晚于**阳性结果日期，否则拒绝且不改变停运。
+- `covered_facilities` 必须覆盖整条接触链（阳性时快照 + 当前仍由该批次停运的场地）；缺任一场地则拒绝、保留全部停运，错误信息列明缺失场地 ID 与名称。
+- 全覆盖时批次进入 `released`，并解除该批次造成的停运（其他批次归因仍在的场地继续停运）。
+
+批次新增状态：`lab_positive`、`lab_negative`。`destroy`/`recheck` 也允许从 `lab_positive` 发起。
 
 ## 主要接口
 

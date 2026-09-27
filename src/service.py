@@ -41,22 +41,85 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        payload = dict(data or {})
+
+        def load_all(kind):
+            return self.repository.list_entities(kind=self.rules.normalize_kind(kind))
+
+        plan = self.rules.plan_transition(actor, entity, action, payload, load_all)
+        if plan is None:
+            expected = int(expected_version) if expected_version is not None else entity["version"]
+            next_status, patch = self.rules.validate_transition(
+                actor, entity, action, payload, self._lookup
+            )
+            merged = dict(entity["data"])
+            merged.update(patch)
+            updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+            self.audit.record(
+                entity_id,
+                actor,
+                action,
+                entity["status"],
+                updated["status"],
+                {"patch": patch},
+            )
+            return updated
+
+        # 重复报告：首次结论保持不变，不产生任何停运/释放效果
+        if plan.get("duplicate"):
+            self.audit.record(
+                entity_id,
+                actor,
+                action,
+                entity["status"],
+                entity["status"],
+                {"duplicate": True, "report_id": payload.get("report_id")},
+            )
+            return entity
+
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
-        )
+        primary = plan["primary"]
+        effects = plan["effects"]
+
+        # 级联对象以计划加载后为基准，合并 patch；乐观锁由原子更新统一兜底
+        effect_entities = {item["id"]: self.repository.get_entity(item["id"]) for item in effects}
         merged = dict(entity["data"])
-        merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+        merged.update(primary["patch"])
+        updates = [(entity_id, expected, primary["status"], merged)]
+        for effect in effects:
+            target = effect_entities[effect["id"]]
+            target_data = dict(target["data"])
+            target_data.update(effect["patch"])
+            updates.append((
+                effect["id"],
+                target["version"],
+                effect["to_status"],
+                target_data,
+            ))
+
+        updated_entities = self.repository.update_entities_atomic(updates)
         self.audit.record(
             entity_id,
             actor,
             action,
             entity["status"],
-            updated["status"],
-            {"patch": patch},
+            primary["status"],
+            plan["detail"],
         )
-        return updated
+        for effect in effects:
+            self.audit.record(
+                effect["id"],
+                actor,
+                effect["action"],
+                effect["from_status"],
+                effect["to_status"],
+                {
+                    "consignment_id": entity_id,
+                    "trigger_action": action,
+                    "type": effect["type"],
+                },
+            )
+        return updated_entities[0]
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

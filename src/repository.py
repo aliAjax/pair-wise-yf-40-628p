@@ -140,6 +140,41 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def update_entities_atomic(self, updates):
+        """在单个事务中更新多个实体；任一版本冲突则整体回滚。
+
+        updates: [(entity_id, expected_version, status, data), ...]
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for entity_id, expected_version, status, data in updates:
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + entity_id)
+                current_version = int(row["version"])
+                if expected_version is not None and current_version != int(expected_version):
+                    raise ConflictError(
+                        "version conflict on %s: expected %s, found %s"
+                        % (entity_id, expected_version, current_version)
+                    )
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (status, payload, now, entity_id, current_version),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return [self.get_entity(item[0]) for item in updates]
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
